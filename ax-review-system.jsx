@@ -139,23 +139,61 @@ function projectFromDb(dbProject) {
   };
 }
 
-function submissionToDb(sub, projectId) {
+// scores의 키를 id에서 label로 변환
+function convertScoresIdToLabel(scores, evalType) {
+  const allItems = EVAL_TYPES[evalType].sections.flatMap((s) => s.items);
+  const idToLabel = {};
+  allItems.forEach((item) => {
+    idToLabel[item.id] = item.label;
+  });
+  
+  const convertedScores = {};
+  Object.keys(scores).forEach((id) => {
+    const label = idToLabel[id] || id; // 매핑이 없으면 원본 키 사용
+    convertedScores[label] = scores[id];
+  });
+  return convertedScores;
+}
+
+// scores의 키를 label에서 id로 변환
+function convertScoresLabelToId(scores, evalType) {
+  const allItems = EVAL_TYPES[evalType].sections.flatMap((s) => s.items);
+  const labelToId = {};
+  allItems.forEach((item) => {
+    labelToId[item.label] = item.id;
+  });
+  
+  const convertedScores = {};
+  Object.keys(scores).forEach((label) => {
+    const id = labelToId[label] || label; // 매핑이 없으면 원본 키 사용 (하위 호환성)
+    convertedScores[id] = scores[label];
+  });
+  return convertedScores;
+}
+
+function submissionToDb(sub, projectId, evalType) {
+  // scores의 키를 id에서 label로 변환
+  const convertedScores = evalType ? convertScoresIdToLabel(sub.scores, evalType) : sub.scores;
+  
   return {
     id: sub.id,
     project_id: projectId,
     name: sub.name,
-    scores: sub.scores,
+    scores: convertedScores,
     total: sub.total,
     comment: sub.comment,
     submitted_at: sub.submittedAt || sub.submitted_at,
   };
 }
 
-function submissionFromDb(dbSub) {
+function submissionFromDb(dbSub, evalType) {
+  // scores의 키를 label에서 id로 변환
+  const convertedScores = evalType ? convertScoresLabelToId(dbSub.scores, evalType) : dbSub.scores;
+  
   return {
     id: dbSub.id,
     name: dbSub.name,
-    scores: dbSub.scores,
+    scores: convertedScores,
     total: dbSub.total,
     comment: dbSub.comment,
     submittedAt: dbSub.submitted_at,
@@ -200,7 +238,7 @@ async function saveProjects(projects) {
   }
 }
 
-async function loadSubmissions(projectId) {
+async function loadSubmissions(projectId, evalType = null) {
   try {
     const { data, error } = await supabase
       .from('submissions')
@@ -209,15 +247,36 @@ async function loadSubmissions(projectId) {
       .order('submitted_at', { ascending: false });
     
     if (error) throw error;
-    return (data || []).map(submissionFromDb);
-  } catch (e) { 
+    
+    // evalType이 없으면 프로젝트 정보를 가져와서 확인
+    if (!evalType) {
+      const { data: projectData } = await supabase
+        .from('projects')
+        .select('eval_type')
+        .eq('id', projectId)
+        .single();
+      evalType = projectData?.eval_type || null;
+    }
+    
+    return (data || []).map(sub => submissionFromDb(sub, evalType));
+  } catch (e) {
     console.error('평가 로드 실패:', e);
-    return []; 
-  }
+    return [];
+}
 }
 
-async function saveSubmissions(projectId, subs) {
+async function saveSubmissions(projectId, subs, evalType = null) {
   try {
+    // evalType이 없으면 프로젝트 정보를 가져와서 확인
+    if (!evalType) {
+      const { data: projectData } = await supabase
+        .from('projects')
+        .select('eval_type')
+        .eq('id', projectId)
+        .single();
+      evalType = projectData?.eval_type || null;
+    }
+    
     // 기존 데이터 삭제 후 전체 재삽입
     const { error: deleteError } = await supabase
       .from('submissions')
@@ -227,7 +286,7 @@ async function saveSubmissions(projectId, subs) {
     if (deleteError) throw deleteError;
     
     if (subs.length > 0) {
-      const dbSubs = subs.map(sub => submissionToDb(sub, projectId));
+      const dbSubs = subs.map(sub => submissionToDb(sub, projectId, evalType));
       const { error: insertError } = await supabase
         .from('submissions')
         .insert(dbSubs);
@@ -332,9 +391,9 @@ function ReviewerEvalScreen({ project, onBack, onSubmitted }) {
     if (!name.trim()) { alert("평가위원 이름을 입력해 주세요."); return; }
     if (!allScored) { alert("모든 항목에 점수를 입력해 주세요. (0점 항목이 있습니다)"); return; }
     const sub = { id: genId(), name: name.trim(), scores, total, comment, submittedAt: new Date().toISOString() };
-    const existing = await loadSubmissions(project.id);
+    const existing = await loadSubmissions(project.id, project.evalType);
     existing.push(sub);
-    await saveSubmissions(project.id, existing);
+    await saveSubmissions(project.id, existing, project.evalType);
     setSubmitted(true);
     if (onSubmitted) onSubmitted();
   };
@@ -568,12 +627,12 @@ function AdminProjectDetail({ project, onBack }) {
   const allItems = sections.flatMap((s) => s.items);
 
   useEffect(() => {
-    loadSubmissions(project.id).then((s) => { setSubs(s); setLoading(false); });
-  }, [project.id]);
+    loadSubmissions(project.id, project.evalType).then((s) => { setSubs(s); setLoading(false); });
+  }, [project.id, project.evalType]);
 
   const refresh = async () => {
     setLoading(true);
-    const s = await loadSubmissions(project.id);
+    const s = await loadSubmissions(project.id, project.evalType);
     setSubs(s);
     setLoading(false);
   };
@@ -581,7 +640,7 @@ function AdminProjectDetail({ project, onBack }) {
   const deleteSub = async (subId) => {
     if (!confirm("이 평가를 삭제하시겠습니까?")) return;
     const next = subs.filter((s) => s.id !== subId);
-    await saveSubmissions(project.id, next);
+    await saveSubmissions(project.id, next, project.evalType);
     setSubs(next);
   };
 
@@ -737,7 +796,7 @@ function AdminPanel({ projects, setProjects, onSwitchMode }) {
     const loadCounts = async () => {
       const counts = {};
       for (const p of projects) {
-        const subs = await loadSubmissions(p.id);
+        const subs = await loadSubmissions(p.id, p.evalType);
         counts[p.id] = subs.length;
       }
       setSubCounts(counts);
@@ -868,7 +927,8 @@ function AdminPanel({ projects, setProjects, onSwitchMode }) {
 
 // ─── 메인 앱 ───
 export default function AXReviewSystem() {
-  const [mode, setMode] = useState(null); // null | "admin" | "reviewer"
+  const [mode, setMode] = useState(null); // null | "admin-auth" | "admin" | "reviewer"
+  const [adminCode, setAdminCode] = useState("");
   const [projects, setProjects] = useState([]);
   const [selectedProject, setSelectedProject] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -876,6 +936,95 @@ export default function AXReviewSystem() {
   useEffect(() => {
     loadProjects().then((p) => { setProjects(p); setLoading(false); });
   }, []);
+
+  // 관리자 인증 화면
+  if (mode === "admin-auth") {
+    const handleAdminCodeSubmit = (e) => {
+      e.preventDefault();
+      if (adminCode === "2541") {
+        setMode("admin");
+        setAdminCode("");
+      } else {
+        alert("잘못된 코드입니다.");
+        setAdminCode("");
+      }
+    };
+
+    return (
+      <div style={{
+        maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: "#f8fafc",
+        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+        padding: 32, fontFamily: "'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif",
+        boxSizing: "border-box",
+      }}>
+        <div style={{
+          width: 72, height: 72, borderRadius: 20, marginBottom: 20,
+          background: "linear-gradient(135deg, #0c2340, #2563eb)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 32, boxShadow: "0 8px 24px rgba(37,99,235,0.3)",
+        }}>🔒</div>
+        <h1 style={{ fontSize: 24, fontWeight: 900, color: "#0f172a", marginBottom: 8, textAlign: "center" }}>관리자 인증</h1>
+        <p style={{ fontSize: 14, color: "#64748b", marginBottom: 32, textAlign: "center" }}>관리자 코드를 입력하세요</p>
+
+        <form onSubmit={handleAdminCodeSubmit} style={{ width: "100%", maxWidth: "100%", boxSizing: "border-box" }}>
+          <input
+            type="password"
+            value={adminCode}
+            onChange={(e) => setAdminCode(e.target.value)}
+            placeholder="코드 입력"
+            style={{
+              width: "100%", padding: "16px", borderRadius: 12, border: "1.5px solid #e2e8f0",
+              fontSize: 16, fontWeight: 600, textAlign: "center", letterSpacing: "4px",
+              background: "#fff", color: "#0f172a", marginBottom: 16,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+              boxSizing: "border-box",
+            }}
+            autoFocus
+          />
+          <div style={{ display: "flex", gap: 12, width: "100%", boxSizing: "border-box", minWidth: 0 }}>
+            <button
+              type="button"
+              onClick={() => { setMode(null); setAdminCode(""); }}
+              style={{
+                flex: "1 1 0", minWidth: 0, padding: "16px", borderRadius: 12, border: "1.5px solid #e2e8f0",
+                background: "#fff", color: "#64748b", fontSize: 16, fontWeight: 700,
+                cursor: "pointer", boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+                boxSizing: "border-box",
+              }}
+            >
+              취소
+            </button>
+            <button
+              type="submit"
+              style={{
+                flex: "1 1 0", minWidth: 0, padding: "16px", borderRadius: 12, border: "none",
+                background: "linear-gradient(135deg, #0c2340, #2563eb)", color: "#fff",
+                fontSize: 16, fontWeight: 700, cursor: "pointer",
+                boxShadow: "0 4px 14px rgba(37,99,235,0.3)",
+                boxSizing: "border-box",
+              }}
+            >
+              확인
+            </button>
+          </div>
+        </form>
+
+        <style>{`
+          input[type="password"]:focus {
+            outline: none;
+            border-color: #93c5fd !important;
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
+          }
+          form {
+            box-sizing: border-box;
+          }
+          form * {
+            box-sizing: border-box;
+          }
+        `}</style>
+      </div>
+    );
+  }
 
   // 모드 선택 화면
   if (mode === null) {
@@ -904,7 +1053,7 @@ export default function AXReviewSystem() {
           <div style={{ fontSize: 12, fontWeight: 500, opacity: 0.7, marginTop: 4 }}>과제를 선택하고 심의 평가를 진행합니다</div>
         </button>
 
-        <button onClick={() => setMode("admin")} style={{
+        <button onClick={() => setMode("admin-auth")} style={{
           width: "100%", padding: "20px", borderRadius: 16, marginBottom: 12,
           border: "1.5px solid #e2e8f0", background: "#fff", color: "#0f172a",
           fontSize: 16, fontWeight: 800, cursor: "pointer", textAlign: "left",
